@@ -52,29 +52,33 @@ leads = []  # completed lead records
 
 
 # ── AI SYSTEM PROMPT ────────────────────────────────────────────────
-SYSTEM_PROMPT = f"""You are a friendly, professional AI receptionist for {BUSINESS_NAME}, a {TRADE_TYPE} business. 
+# ── LOAD TRADE-SPECIFIC PROMPT ──────────────────────────────────────
+# Prompts live in the prompts/ folder. Each trade has its own file.
+# The {business_name} placeholder gets replaced with the real name.
 
-Your job is to:
-1. Greet the caller warmly
-2. Find out what they need (the {TRADE_TYPE} issue)
-3. Assess urgency (emergency/urgent/can wait)
-4. Get their name, address, and best callback time
-5. Reassure them that the contractor will reach out shortly
+def load_prompt(trade_type, business_name):
+    """Load the AI personality prompt for a specific trade."""
+    prompt_file = os.path.join(os.path.dirname(__file__), "prompts", f"{trade_type}.txt")
+    
+    if os.path.exists(prompt_file):
+        with open(prompt_file, "r") as f:
+            prompt = f.read()
+        # Replace the placeholder with the actual business name
+        prompt = prompt.replace("{business_name}", business_name)
+        logger.info(f"Loaded custom prompt for trade: {trade_type}")
+        return prompt
+    else:
+        # Fallback generic prompt if no trade-specific file exists
+        logger.warning(f"No prompt file for '{trade_type}', using generic")
+        return f"""You are a warm, friendly receptionist for {business_name}. Your name is Sarah.
+You sound like a small-town office manager who genuinely cares about people.
+Your job: find out what they need, how urgent it is, get their name, address, 
+phone number, and best callback time. Keep responses to 2-3 sentences.
+Reassure them that {business_name} will reach out shortly.
+Don't say you're an AI unless asked — say you're the answering service.
+RESPOND WITH ONLY YOUR SPOKEN WORDS. No formatting."""
 
-RULES:
-- Be warm, human, and conversational — NOT robotic
-- Use simple language, no jargon
-- Be empathetic — they're calling because they have a problem
-- Keep responses SHORT (2-3 sentences max) — this is a phone call, not an essay
-- If they say it's an emergency, prioritize getting their address and phone number fast
-- Don't say you're an AI unless directly asked. Say "I'm the answering service for {BUSINESS_NAME}"
-- If asked about pricing, say "{BUSINESS_NAME} will be happy to give you a quote when they call back"
-- If it's not related to {TRADE_TYPE}, politely explain what {BUSINESS_NAME} does
-
-After gathering info, say something like:
-"Great, I've got everything I need. I'm sending your details to [contractor] right now and they'll reach out to you shortly. Is there anything else?"
-
-RESPOND WITH ONLY YOUR SPOKEN WORDS. No actions, no stage directions, no formatting."""
+SYSTEM_PROMPT = load_prompt(TRADE_TYPE, BUSINESS_NAME)
 
 
 # ── HELPER FUNCTIONS ────────────────────────────────────────────────
