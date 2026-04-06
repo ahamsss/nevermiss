@@ -1,21 +1,7 @@
 """
-NeverMiss v2 — AI Receptionist for Trades
-Using Twilio ConversationRelay (WebSocket) for low-latency voice AI.
-
-ARCHITECTURE (v2):
-  Customer calls Twilio number
-    → Twilio sends TwiML with <ConversationRelay> 
-    → ConversationRelay opens WebSocket to our server
-    → Twilio handles STT/TTS natively (low latency, interruptions)
-    → Our server sends/receives text via WebSocket
-    → Claude AI generates responses
-    → After call: extract lead → text contractor
-
-IMPROVEMENTS OVER v1:
-  - WebSocket instead of webhooks = ~10x lower latency
-  - ConversationRelay handles STT/TTS = no more Polly round-trips  
-  - Multi-tenant: each customer gets their own phone number + config
-  - Usage logging: tracks calls, minutes, tokens per customer
+NeverMiss v2.1 — AI Receptionist for Trades
+Webhook-based voice (works on Twilio trial) + multi-tenant + usage logging.
+Will upgrade to ConversationRelay when on paid Twilio account.
 """
 
 import os
@@ -25,8 +11,10 @@ import sqlite3
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import Response
+from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
 import anthropic
 
@@ -37,21 +25,25 @@ logger = logging.getLogger("nevermiss")
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost:8080")
 PORT = int(os.environ.get("PORT", 8080))
 
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID else None
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+twilio_client = None
+claude_client = None
 
 
-# ── DATABASE (SQLite for MVP, upgrade to Postgres later) ───────────
+def init_clients():
+    global twilio_client, claude_client
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    if ANTHROPIC_API_KEY:
+        claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+# ── DATABASE ───────────────────────────────────────────────────────
 
 def init_db():
-    """Create tables for customer configs and usage logging."""
     conn = sqlite3.connect("nevermiss.db")
     c = conn.cursor()
-    
-    # Customer configs — keyed by their Twilio phone number
     c.execute("""CREATE TABLE IF NOT EXISTS customers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         twilio_number TEXT UNIQUE NOT NULL,
@@ -61,14 +53,9 @@ def init_db():
         contractor_name TEXT DEFAULT '',
         service_area TEXT DEFAULT '',
         custom_greeting TEXT DEFAULT '',
-        pricing_note TEXT DEFAULT '',
-        specialties TEXT DEFAULT '',
-        plan TEXT DEFAULT 'pro',
         status TEXT DEFAULT 'active',
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )""")
-    
-    # Usage logging — one row per call
     c.execute("""CREATE TABLE IF NOT EXISTS call_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         customer_id INTEGER,
@@ -80,20 +67,17 @@ def init_db():
         address TEXT DEFAULT '',
         best_time TEXT DEFAULT 'ASAP',
         duration_seconds INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'completed',
         lead_texted INTEGER DEFAULT 0,
         booked INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (customer_id) REFERENCES customers(id)
     )""")
-    
     conn.commit()
     conn.close()
     logger.info("Database initialized")
 
 
 def get_customer_by_number(twilio_number):
-    """Look up customer config by their Twilio phone number."""
     conn = sqlite3.connect("nevermiss.db")
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -104,18 +88,15 @@ def get_customer_by_number(twilio_number):
 
 
 def add_customer(twilio_number, business_name, trade_type, contractor_phone, **kwargs):
-    """Add a new customer config."""
     conn = sqlite3.connect("nevermiss.db")
     c = conn.cursor()
-    c.execute("""INSERT INTO customers (twilio_number, business_name, trade_type, contractor_phone,
-                contractor_name, service_area, custom_greeting, pricing_note, specialties)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+    c.execute("""INSERT OR REPLACE INTO customers (twilio_number, business_name, trade_type, contractor_phone,
+                contractor_name, service_area, custom_greeting)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
               (twilio_number, business_name, trade_type, contractor_phone,
                kwargs.get("contractor_name", ""),
                kwargs.get("service_area", ""),
-               kwargs.get("custom_greeting", ""),
-               kwargs.get("pricing_note", ""),
-               kwargs.get("specialties", "")))
+               kwargs.get("custom_greeting", "")))
     conn.commit()
     customer_id = c.lastrowid
     conn.close()
@@ -124,7 +105,6 @@ def add_customer(twilio_number, business_name, trade_type, contractor_phone, **k
 
 
 def log_call(customer_id, call_sid, caller_phone, **kwargs):
-    """Log a completed call for usage tracking."""
     conn = sqlite3.connect("nevermiss.db")
     c = conn.cursor()
     c.execute("""INSERT INTO call_log (customer_id, call_sid, caller_phone, caller_name,
@@ -142,37 +122,14 @@ def log_call(customer_id, call_sid, caller_phone, **kwargs):
     conn.close()
 
 
-def get_usage_stats(customer_id, month=None):
-    """Get usage stats for a customer (for monitoring heavy users)."""
-    conn = sqlite3.connect("nevermiss.db")
-    c = conn.cursor()
-    if month is None:
-        month = datetime.now().strftime("%Y-%m")
-    c.execute("""SELECT COUNT(*) as total_calls, 
-                SUM(duration_seconds) as total_seconds,
-                SUM(CASE WHEN booked = 1 THEN 1 ELSE 0 END) as booked_calls
-                FROM call_log WHERE customer_id = ? AND created_at LIKE ?""",
-              (customer_id, f"{month}%"))
-    row = c.fetchone()
-    conn.close()
-    return {
-        "total_calls": row[0] or 0,
-        "total_minutes": round((row[1] or 0) / 60, 1),
-        "booked_calls": row[2] or 0,
-    }
-
-
-# ── LOAD TRADE-SPECIFIC PROMPTS ────────────────────────────────────
+# ── AI PROMPTS ─────────────────────────────────────────────────────
 
 def load_prompt(trade_type, business_name):
-    """Load the AI personality prompt for a specific trade."""
     prompt_file = os.path.join(os.path.dirname(__file__), "prompts", f"{trade_type}.txt")
-    
     if os.path.exists(prompt_file):
         with open(prompt_file, "r") as f:
             prompt = f.read()
-        prompt = prompt.replace("{business_name}", business_name)
-        return prompt
+        return prompt.replace("{business_name}", business_name)
     else:
         return f"""You are a warm, friendly receptionist for {business_name}. Your name is Sarah.
 You sound like a small-town office manager who genuinely cares about people.
@@ -183,240 +140,43 @@ Don't say you're an AI unless asked — say you're the answering service.
 RESPOND WITH ONLY YOUR SPOKEN WORDS. No formatting."""
 
 
-# ── ACTIVE CALL SESSIONS ───────────────────────────────────────────
+# ── ACTIVE CALLS ───────────────────────────────────────────────────
 
-sessions = {}  # call_sid -> { messages, customer, caller_phone, start_time }
-
-
-# ── FASTAPI APP ────────────────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(app):
-    init_db()
-    
-    # Add a default customer if none exist (for testing)
-    if not get_customer_by_number(os.environ.get("TWILIO_PHONE_NUMBER", "")):
-        default_number = os.environ.get("TWILIO_PHONE_NUMBER", "+10000000000")
-        add_customer(
-            twilio_number=default_number,
-            business_name=os.environ.get("BUSINESS_NAME", "Demo Plumbing"),
-            trade_type=os.environ.get("TRADE_TYPE", "plumbing"),
-            contractor_phone=os.environ.get("CONTRACTOR_PHONE", "+10000000000"),
-        )
-    
-    logger.info(f"NeverMiss v2 starting on port {PORT}")
-    logger.info(f"Domain: {DOMAIN}")
-    yield
-
-app = FastAPI(lifespan=lifespan)
+calls = {}  # call_sid -> { messages, customer, caller_phone, start_time }
 
 
-# ── TWIML ENDPOINT (tells Twilio to use ConversationRelay) ─────────
+def get_ai_response(call_sid, caller_message, system_prompt):
+    if call_sid not in calls:
+        calls[call_sid] = {"messages": [], "start_time": datetime.now()}
 
-@app.post("/voice")
-async def handle_voice(request: Request):
-    """
-    Twilio hits this when someone calls.
-    We return TwiML that starts a ConversationRelay WebSocket session.
-    """
-    form = await request.form()
-    called_number = form.get("Called", "")
-    caller_phone = form.get("From", "unknown")
-    
-    # Look up which customer this call is for (by the Twilio number they called)
-    customer = get_customer_by_number(called_number)
-    
-    if customer:
-        greeting = customer.get("custom_greeting") or \
-            f"Hi there! Thanks for calling {customer['business_name']}. This is Sarah, how can I help you today?"
-    else:
-        # Fallback for unknown numbers
-        greeting = "Hi there! Thanks for calling. This is Sarah, how can I help you today?"
-    
-    logger.info(f"Incoming call to {called_number} from {caller_phone}")
-    
-    # Build TwiML with ConversationRelay
-    ws_url = f"wss://{DOMAIN}/ws"
-    
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Connect>
-        <ConversationRelay 
-            url="{ws_url}" 
-            welcomeGreeting="{greeting}"
-            voice="en-US-Standard-F"
-            transcriptionProvider="google"
-            ttsProvider="google"
-        >
-            <Parameter name="called_number" value="{called_number}" />
-            <Parameter name="caller_phone" value="{caller_phone}" />
-        </ConversationRelay>
-    </Connect>
-</Response>"""
-    
-    return Response(content=twiml, media_type="text/xml")
+    calls[call_sid]["messages"].append({"role": "user", "content": caller_message})
+
+    response = claude_client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=200,
+        system=system_prompt,
+        messages=calls[call_sid]["messages"]
+    )
+
+    ai_text = response.content[0].text
+    calls[call_sid]["messages"].append({"role": "assistant", "content": ai_text})
+    return ai_text
 
 
-# ── WEBSOCKET ENDPOINT (ConversationRelay talks to us here) ────────
+def extract_lead_info(call_sid):
+    conversation = calls.get(call_sid, {}).get("messages", [])
+    if not conversation:
+        return None
 
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    """
-    ConversationRelay connects here via WebSocket.
-    We receive transcribed speech, send text responses.
-    Twilio handles STT and TTS — we just deal with text.
-    """
-    await ws.accept()
-    call_sid = None
-    customer = None
-    caller_phone = "unknown"
-    
-    try:
-        while True:
-            data = await ws.receive_text()
-            message = json.loads(data)
-            msg_type = message.get("type", "")
-            
-            # ── SETUP: First message when WebSocket connects ──
-            if msg_type == "setup":
-                call_sid = message.get("callSid", "unknown")
-                
-                # Extract custom parameters we passed in TwiML
-                custom_params = message.get("customParameters", {})
-                called_number = custom_params.get("called_number", "")
-                caller_phone = custom_params.get("caller_phone", "unknown")
-                
-                # Look up customer config
-                customer = get_customer_by_number(called_number)
-                
-                if customer:
-                    system_prompt = load_prompt(customer["trade_type"], customer["business_name"])
-                else:
-                    system_prompt = load_prompt("plumbing", "the business")
-                
-                # Initialize session
-                sessions[call_sid] = {
-                    "messages": [],
-                    "system_prompt": system_prompt,
-                    "customer": customer,
-                    "caller_phone": caller_phone,
-                    "start_time": datetime.now(),
-                }
-                
-                logger.info(f"WebSocket connected for call {call_sid}")
-                logger.info(f"Customer: {customer['business_name'] if customer else 'Unknown'}")
-            
-            # ── PROMPT: Caller said something (transcribed text) ──
-            elif msg_type == "prompt":
-                voice_input = message.get("voicePrompt", "")
-                
-                if not voice_input or not call_sid or call_sid not in sessions:
-                    continue
-                
-                logger.info(f"Caller said: {voice_input}")
-                
-                session = sessions[call_sid]
-                session["messages"].append({
-                    "role": "user",
-                    "content": voice_input
-                })
-                
-                # Get AI response
-                try:
-                    response = claude_client.messages.create(
-                        model="claude-sonnet-4-20250514",
-                        max_tokens=150,
-                        system=session["system_prompt"],
-                        messages=session["messages"]
-                    )
-                    
-                    ai_text = response.content[0].text
-                    
-                    session["messages"].append({
-                        "role": "assistant",
-                        "content": ai_text
-                    })
-                    
-                    logger.info(f"Sarah says: {ai_text}")
-                    
-                    # Check if conversation is wrapping up
-                    is_ending = any(phrase in ai_text.lower() for phrase in [
-                        "reach out", "call you back", "get back to you",
-                        "hang in there", "have a great", "take care",
-                        "anything else"
-                    ]) and len(session["messages"]) >= 6
-                    
-                    # Send response back via WebSocket
-                    # ConversationRelay will convert it to speech
-                    await ws.send_json({
-                        "type": "text",
-                        "token": ai_text,
-                        "last": True  # This is a complete response
-                    })
-                    
-                    # If wrapping up and enough exchanges, end after this
-                    if is_ending and len(session["messages"]) >= 8:
-                        # Give a moment for the last message to play
-                        await ws.send_json({
-                            "type": "end",
-                            "handoffData": json.dumps({
-                                "reason": "conversation_complete",
-                                "call_sid": call_sid
-                            })
-                        })
-                
-                except Exception as e:
-                    logger.error(f"Claude API error: {e}")
-                    await ws.send_json({
-                        "type": "text",
-                        "token": "I'm sorry, I'm having a little trouble right now. Can you give me just a moment?",
-                        "last": True
-                    })
-            
-            # ── INTERRUPT: Caller interrupted the AI ──
-            elif msg_type == "interrupt":
-                logger.info(f"Caller interrupted. Utterance until interrupt: {message.get('utteranceUntilInterrupt', '')}")
-            
-            # ── DTMF: Caller pressed a key ──
-            elif msg_type == "dtmf":
-                logger.info(f"DTMF received: {message.get('digit', '')}")
-            
-            # ── ERROR ──
-            elif msg_type == "error":
-                logger.error(f"ConversationRelay error: {message}")
-    
-    except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected for call {call_sid}")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-    finally:
-        # Call ended — extract lead and send text
-        if call_sid and call_sid in sessions:
-            await process_call_end(call_sid)
-
-
-async def process_call_end(call_sid):
-    """Extract lead info and text it to the contractor."""
-    session = sessions.get(call_sid)
-    if not session or not session.get("messages"):
-        return
-    
-    customer = session.get("customer")
-    caller_phone = session.get("caller_phone", "Unknown")
-    start_time = session.get("start_time", datetime.now())
-    duration = int((datetime.now() - start_time).total_seconds())
-    
-    # Extract structured lead data
     convo_text = "\n".join([
         f"{'Caller' if m['role'] == 'user' else 'AI'}: {m['content']}"
-        for m in session["messages"]
+        for m in conversation
     ])
-    
-    try:
-        extraction = claude_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=500,
-            system="""Extract lead information from this phone conversation.
+
+    response = claude_client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=500,
+        system="""Extract lead information from this phone conversation.
 Return ONLY valid JSON with these fields:
 {
   "name": "caller's name or 'Unknown'",
@@ -426,33 +186,28 @@ Return ONLY valid JSON with these fields:
   "best_time": "when they want a callback or 'ASAP'",
   "notes": "any other relevant details"
 }""",
-            messages=[{"role": "user", "content": convo_text}]
-        )
-        
-        text = extraction.content[0].text.strip()
+        messages=[{"role": "user", "content": convo_text}]
+    )
+
+    try:
+        text = response.content[0].text.strip()
         text = text.replace("```json", "").replace("```", "").strip()
-        lead_info = json.loads(text)
-    except Exception as e:
-        logger.error(f"Lead extraction failed: {e}")
-        lead_info = {
-            "name": "Unknown",
-            "issue": "Call completed but details could not be extracted",
-            "urgency": "medium",
-            "address": "Not provided",
-            "best_time": "ASAP",
-            "notes": ""
-        }
-    
-    # Format and send text to contractor
+        return json.loads(text)
+    except (json.JSONDecodeError, IndexError):
+        logger.error(f"Failed to parse lead info for call {call_sid}")
+        return None
+
+
+def send_lead_text(customer, caller_phone, lead_info):
     urgency_emoji = {
         "emergency": "\U0001F6A8 EMERGENCY",
         "high": "\U0001F534 URGENT",
         "medium": "\U0001F7E1 Medium",
         "low": "\U0001F7E2 Low priority"
     }
-    
+
     urgency = urgency_emoji.get(lead_info.get("urgency", "medium"), "\U0001F7E1 Medium")
-    
+
     sms_body = (
         f"{urgency}\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -465,9 +220,8 @@ Return ONLY valid JSON with these fields:
     if lead_info.get("notes"):
         sms_body += f"\U0001F4DD {lead_info['notes']}\n"
     sms_body += f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\nReply BOOK to confirm or PASS to skip"
-    
-    # Send the text
-    if customer and twilio_client:
+
+    if twilio_client:
         try:
             twilio_client.messages.create(
                 body=sms_body,
@@ -475,8 +229,180 @@ Return ONLY valid JSON with these fields:
                 to=customer["contractor_phone"]
             )
             logger.info(f"Lead text sent to {customer['contractor_phone']}")
-            
-            # Log the call
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send text: {e}")
+            return False
+    else:
+        logger.info(f"[DEV MODE] Would text:\n{sms_body}")
+        return False
+
+
+# ── FASTAPI APP ────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app):
+    init_clients()
+    init_db()
+
+    default_number = os.environ.get("TWILIO_PHONE_NUMBER", "")
+    if default_number and not get_customer_by_number(default_number):
+        add_customer(
+            twilio_number=default_number,
+            business_name=os.environ.get("BUSINESS_NAME", "Demo Plumbing"),
+            trade_type=os.environ.get("TRADE_TYPE", "plumbing"),
+            contractor_phone=os.environ.get("CONTRACTOR_PHONE", "+10000000000"),
+        )
+
+    logger.info(f"NeverMiss v2.1 starting on port {PORT}")
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+
+# ── VOICE WEBHOOKS ─────────────────────────────────────────────────
+
+@app.post("/voice")
+async def handle_voice(request: Request):
+    form = await request.form()
+    call_sid = form.get("CallSid", "unknown")
+    caller_phone = form.get("From", "unknown")
+    called_number = form.get("Called", form.get("To", ""))
+
+    logger.info(f"Incoming call: {call_sid} from {caller_phone} to {called_number}")
+
+    customer = get_customer_by_number(called_number)
+
+    if customer:
+        system_prompt = load_prompt(customer["trade_type"], customer["business_name"])
+        calls[call_sid] = {
+            "messages": [],
+            "customer": customer,
+            "caller_phone": caller_phone,
+            "system_prompt": system_prompt,
+            "start_time": datetime.now(),
+        }
+        greeting = get_ai_response(call_sid, "[Caller just connected — greet them warmly]", system_prompt)
+    else:
+        greeting = "Hi there! Thanks for calling. How can I help you today?"
+        calls[call_sid] = {
+            "messages": [],
+            "customer": None,
+            "caller_phone": caller_phone,
+            "system_prompt": load_prompt("plumbing", "the business"),
+            "start_time": datetime.now(),
+        }
+
+    response = VoiceResponse()
+    gather = Gather(
+        input="speech",
+        action=f"/voice/continue?call_sid={call_sid}",
+        timeout=5,
+        speech_timeout="auto",
+        language="en-US",
+    )
+    gather.say(greeting, voice="Polly.Joanna")
+    response.append(gather)
+    response.say("Are you still there? I'm here to help whenever you're ready.", voice="Polly.Joanna")
+    response.redirect(f"/voice?CallSid={call_sid}&From={caller_phone}&Called={called_number}")
+
+    return Response(content=str(response), media_type="text/xml")
+
+
+@app.post("/voice/continue")
+async def handle_continue(request: Request):
+    form = await request.form()
+    call_sid = form.get("call_sid", request.query_params.get("call_sid", "unknown"))
+    caller_speech = form.get("SpeechResult", "")
+
+    logger.info(f"Caller said: {caller_speech}")
+
+    if not caller_speech:
+        response = VoiceResponse()
+        response.say("Sorry, I didn't catch that. Could you repeat that?", voice="Polly.Joanna")
+        gather = Gather(
+            input="speech",
+            action=f"/voice/continue?call_sid={call_sid}",
+            timeout=5,
+            speech_timeout="auto",
+        )
+        response.append(gather)
+        return Response(content=str(response), media_type="text/xml")
+
+    call_data = calls.get(call_sid, {})
+    system_prompt = call_data.get("system_prompt", load_prompt("plumbing", "the business"))
+
+    ai_response = get_ai_response(call_sid, caller_speech, system_prompt)
+    logger.info(f"Sarah says: {ai_response}")
+
+    conversation_length = len(calls.get(call_sid, {}).get("messages", []))
+    is_wrapping_up = any(phrase in ai_response.lower() for phrase in [
+        "reach out", "call you back", "get back to you",
+        "hang in there", "have a great", "take care", "anything else"
+    ]) and conversation_length >= 6
+
+    response = VoiceResponse()
+
+    if is_wrapping_up:
+        response.say(ai_response, voice="Polly.Joanna")
+        gather = Gather(
+            input="speech",
+            action=f"/voice/wrapup?call_sid={call_sid}",
+            timeout=3,
+            speech_timeout="auto",
+        )
+        response.append(gather)
+        response.redirect(f"/voice/end?call_sid={call_sid}")
+    else:
+        gather = Gather(
+            input="speech",
+            action=f"/voice/continue?call_sid={call_sid}",
+            timeout=5,
+            speech_timeout="auto",
+        )
+        gather.say(ai_response, voice="Polly.Joanna")
+        response.append(gather)
+        response.say("I'm still here if you need anything.", voice="Polly.Joanna")
+
+    return Response(content=str(response), media_type="text/xml")
+
+
+@app.post("/voice/wrapup")
+async def handle_wrapup(request: Request):
+    form = await request.form()
+    call_sid = request.query_params.get("call_sid", "unknown")
+    caller_speech = form.get("SpeechResult", "")
+
+    response = VoiceResponse()
+    if caller_speech:
+        call_data = calls.get(call_sid, {})
+        system_prompt = call_data.get("system_prompt", load_prompt("plumbing", "the business"))
+        ai_text = get_ai_response(call_sid, caller_speech, system_prompt)
+        response.say(ai_text, voice="Polly.Joanna")
+
+    response.redirect(f"/voice/end?call_sid={call_sid}")
+    return Response(content=str(response), media_type="text/xml")
+
+
+@app.api_route("/voice/end", methods=["GET", "POST"])
+async def handle_end(request: Request):
+    call_sid = request.query_params.get("call_sid", "unknown")
+
+    response = VoiceResponse()
+    response.say("Thanks for calling. Have a great day!", voice="Polly.Joanna")
+    response.hangup()
+
+    # Process the call — extract lead and send text
+    try:
+        call_data = calls.get(call_sid, {})
+        customer = call_data.get("customer")
+        caller_phone = call_data.get("caller_phone", "Unknown")
+        start_time = call_data.get("start_time", datetime.now())
+        duration = int((datetime.now() - start_time).total_seconds())
+
+        lead_info = extract_lead_info(call_sid)
+        if lead_info and customer:
+            texted = send_lead_text(customer, caller_phone, lead_info)
             log_call(
                 customer_id=customer["id"],
                 call_sid=call_sid,
@@ -487,41 +413,44 @@ Return ONLY valid JSON with these fields:
                 address=lead_info.get("address", ""),
                 best_time=lead_info.get("best_time", "ASAP"),
                 duration_seconds=duration,
-                lead_texted=1,
+                lead_texted=1 if texted else 0,
             )
-        except Exception as e:
-            logger.error(f"Failed to send lead text: {e}")
-    else:
-        logger.info(f"[DEV MODE] Would text:\n{sms_body}")
-    
-    # Clean up session
-    del sessions[call_sid]
+            logger.info(f"Lead captured: {lead_info}")
+        elif customer:
+            send_lead_text(customer, caller_phone, {
+                "name": "Unknown",
+                "issue": "Caller hung up before providing details",
+                "urgency": "medium",
+                "address": "Not provided",
+                "best_time": "Try calling back",
+            })
+
+        if call_sid in calls:
+            del calls[call_sid]
+    except Exception as e:
+        logger.error(f"Error processing call end: {e}")
+
+    return Response(content=str(response), media_type="text/xml")
 
 
-# ── SMS WEBHOOK (contractor replies) ───────────────────────────────
+# ── SMS WEBHOOK ────────────────────────────────────────────────────
 
 @app.post("/sms")
 async def handle_sms(request: Request):
-    """Handle BOOK/PASS replies from contractors."""
     form = await request.form()
     from_number = form.get("From", "")
     body = form.get("Body", "").strip().upper()
     to_number = form.get("To", "")
-    
-    # Find which customer replied
+
     customer = get_customer_by_number(to_number)
-    
-    from twilio.twiml.messaging_response import MessagingResponse
     resp = MessagingResponse()
-    
+
     if customer and from_number == customer["contractor_phone"]:
         if body == "BOOK":
             resp.message("\u2705 Marked as booked! Don't forget to call them back.")
-            # Update the most recent call log entry
             conn = sqlite3.connect("nevermiss.db")
             c = conn.cursor()
-            c.execute("""UPDATE call_log SET booked = 1 
-                        WHERE customer_id = ? ORDER BY id DESC LIMIT 1""",
+            c.execute("UPDATE call_log SET booked = 1 WHERE customer_id = ? ORDER BY id DESC LIMIT 1",
                       (customer["id"],))
             conn.commit()
             conn.close()
@@ -529,7 +458,7 @@ async def handle_sms(request: Request):
             resp.message("\U0001F44D Lead passed. We'll keep answering your calls.")
         else:
             resp.message("Reply BOOK to confirm a job or PASS to skip.")
-    
+
     return Response(content=str(resp), media_type="text/xml")
 
 
@@ -537,12 +466,10 @@ async def handle_sms(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "nevermiss", "version": "2.0"}
-
+    return {"status": "ok", "service": "nevermiss", "version": "2.1"}
 
 @app.get("/api/customers")
 async def list_customers():
-    """List all active customers."""
     conn = sqlite3.connect("nevermiss.db")
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -551,31 +478,20 @@ async def list_customers():
     conn.close()
     return rows
 
-
-@app.get("/api/customers/{customer_id}/usage")
-async def customer_usage(customer_id: int):
-    """Get usage stats for a specific customer."""
-    return get_usage_stats(customer_id)
-
-
 @app.get("/api/calls")
 async def recent_calls():
-    """Get recent calls across all customers."""
     conn = sqlite3.connect("nevermiss.db")
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute("""SELECT cl.*, cu.business_name 
-                FROM call_log cl 
-                JOIN customers cu ON cl.customer_id = cu.id 
+    c.execute("""SELECT cl.*, cu.business_name FROM call_log cl
+                JOIN customers cu ON cl.customer_id = cu.id
                 ORDER BY cl.id DESC LIMIT 50""")
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
     return rows
 
-
 @app.post("/api/customers")
 async def create_customer(request: Request):
-    """API endpoint to add a new customer."""
     data = await request.json()
     customer_id = add_customer(
         twilio_number=data["twilio_number"],
@@ -585,13 +501,11 @@ async def create_customer(request: Request):
         contractor_name=data.get("contractor_name", ""),
         service_area=data.get("service_area", ""),
         custom_greeting=data.get("custom_greeting", ""),
-        pricing_note=data.get("pricing_note", ""),
-        specialties=data.get("specialties", ""),
     )
     return {"id": customer_id, "status": "created"}
 
 
-# ── RUN ─────────────────────────────────────────────────────────────
+# ── RUN ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
