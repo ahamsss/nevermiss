@@ -450,7 +450,7 @@ async def handle_sms(request: Request):
             resp.message("\u2705 Marked as booked! Don't forget to call them back.")
             conn = sqlite3.connect("nevermiss.db")
             c = conn.cursor()
-            c.execute("UPDATE call_log SET booked = 1 WHERE customer_id = ? ORDER BY id DESC LIMIT 1",
+            c.execute("UPDATE call_log SET booked = 1 WHERE id = (SELECT id FROM call_log WHERE customer_id = ? ORDER BY id DESC LIMIT 1)",
                       (customer["id"],))
             conn.commit()
             conn.close()
